@@ -1,0 +1,106 @@
+TEMPERATURES = [0.1, 0.3, 0.5, 0.7, 0.8, 1.0, 1.2, 1.5, 2.0]
+GAMES_PER_TEMP = 8
+
+all_temp_summaries = []
+
+for T in TEMPERATURES:
+    print(f"\n==================================================")
+    print(f"       RUNNING ANALYSIS FOR TEMPERATURE T = {T}")
+    print(f"==================================================")
+
+    temp_records = []
+
+    for g in range(1, GAMES_PER_TEMP + 1):
+        print(f"\n--- [T={T}] Generating Game {g}/{GAMES_PER_TEMP} ---")
+
+        token_ids, board, illegal_rate = generate_game_with_verification_loop(
+            model, max_new_moves=REASONABLE_MAX_PLIES, max_attempts=5
+        )
+
+        stuck, threefold, avg_conf = analyze_game_repetition_and_confidence(model, token_ids)
+        sharpness, interest = analyze_game_interestingness(board)
+
+        status = "COMPLETED" if board.is_game_over(claim_draw=True) else "TRUNCATED"
+        print(f"Game {g} Status: {status} | Moves: {len(board.move_stack)} | Result: {board.result(claim_draw=True)}")
+        print(f"Metrics -> Confidence: {avg_conf:.4f} | Illegal Rate: {illegal_rate:.4f} | Interestingness (0-100): {interest:.2f} | Sharpness (Stability): {sharpness:.2f}")
+
+        last_move = board.peek() if len(board.move_stack) > 0 else None
+        svg_data = chess.svg.board(board=board, lastmove=last_move)
+        svg_filename = f"{RESULTS_DIR}/visualizations/temp_{T}_game_{g}_{status.lower()}.svg"
+        with open(svg_filename, "w") as f_svg:
+            f_svg.write(svg_data)
+
+        temp_records.append({
+            "temperature": T,
+            "game_id": g,
+            "moves": len(board.move_stack),
+            "illegal_rate": illegal_rate,
+            "stuck_loop": stuck,
+            "threefold_end": threefold,
+            "confidence": avg_conf,
+            "sharpness": sharpness,
+            "interestingness": interest
+        })
+
+    print(f"\n--- Running Multi-Game Stockfish Match for T={T} ---")
+    score_total, est_elo = estimate_model_elo(model, target_elo=1500, num_games=4, temperature=T)
+    print(f"Stockfish Match Points: {score_total}/4.0 | Estimated Performance Elo: {est_elo:.0f}")
+
+    df_temp = pd.DataFrame(temp_records)
+    avg_len = df_temp["moves"].mean()
+    avg_illegal = df_temp["illegal_rate"].mean()
+    avg_conf = df_temp["confidence"].mean()
+    avg_interest = df_temp["interestingness"].mean()
+    truncation_rate = (df_temp["moves"] == REASONABLE_MAX_PLIES).mean() * 100.0
+
+    print(f"\n--- TEMPERATURE {T} SUMMARY ---")
+    print(f"Avg Game Length: {avg_len:.1f} moves")
+    print(f"Truncation Rate: {truncation_rate:.1f}%")
+    print(f"Avg Confidence: {avg_conf:.4f}")
+    print(f"Avg Illegal-Move Rate: {avg_illegal:.4f}")
+    print(f"Avg Interestingness (0-100): {avg_interest:.2f}")
+
+    summary_entry = {
+        "temperature": T,
+        "avg_game_length": avg_len,
+        "truncation_rate_pct": truncation_rate,
+        "avg_confidence": avg_conf,
+        "avg_illegal_rate": avg_illegal,
+        "avg_interestingness": avg_interest,
+        "stockfish_match_score": score_total,
+        "estimated_elo": est_elo
+    }
+    all_temp_summaries.append(summary_entry)
+
+    with open(f"{RESULTS_DIR}/temperature_sweep/temp_{T}_full_results.json", "w") as f_json:
+        json.dump(temp_records, f_json, indent=4)
+
+df_all = pd.DataFrame(all_temp_summaries)
+df_all.to_csv(f"{RESULTS_DIR}/full_temperature_sweep_summary.csv", index=False)
+
+print("\n==================================================")
+print("     FINAL COMPARISON ACROSS ALL TEMPERATURES")
+print("==================================================")
+print(df_all.to_string(index=False))
+
+best_row = df_all.loc[df_all["avg_interestingness"].idxmax()]
+BEST_TEMPERATURE = best_row["temperature"]
+print(f"\nBest temperature by avg interestingness: T={BEST_TEMPERATURE} "
+      f"(avg interestingness={best_row['avg_interestingness']:.2f})")
+
+# Run Held-Out K-Prefix Sweep with Accuracy Calculation
+holdout_games = download_and_fix_holdout_games()
+
+K_VALUES_HELDOUT = [10, 25, 50, 100, 150]
+print(f"\n--- Running Held-Out K-Prefix Experiment at T={BEST_TEMPERATURE} "
+      f"({len(holdout_games)} fixed real games, never seen in training) ---")
+
+heldout_k_df = run_heldout_k_experiment(
+    model, holdout_games, k_values=K_VALUES_HELDOUT, temperature=BEST_TEMPERATURE
+)
+
+print("\n=== HELD-OUT K-PREFIX METRICS (mean \u00b1 sd) ===")
+print(heldout_k_df.to_string())
+
+heldout_k_df.to_csv(f"{RESULTS_DIR}/k_table/heldout_k_sweep_best_temperature.csv")
+print(f"\nSaved to {RESULTS_DIR}/k_table/heldout_k_sweep_best_temperature.csv")
