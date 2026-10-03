@@ -1,0 +1,63 @@
+max_iters = 8000
+eval_interval = 200
+learning_rate = 3e-4
+eval_iters = 200
+weight_decay = 0.1
+warmup_iters = 200
+
+model = BabyGPT().to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+def lr_lambda(step):
+    if step < warmup_iters:
+        return step / max(1, warmup_iters)
+    progress = (step - warmup_iters) / max(1, max_iters - warmup_iters)
+    return 0.5 * (1 + math.cos(math.pi * progress))
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            _, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+best_val_loss = float('inf')
+best_state_dict = None
+
+for iter in range(max_iters):
+    if iter % eval_interval == 0 or iter == max_iters - 1:
+        losses = estimate_loss()
+        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if losses['val'] < best_val_loss:
+            best_val_loss = losses['val']
+            best_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+
+    xb, yb = get_batch('train')
+    logits, loss = model(xb, yb)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+    scheduler.step()
+
+final_checkpoint = {
+    "model_state_dict": best_state_dict if best_state_dict is not None else model.state_dict(),
+    "n_embd": n_embd,
+    "n_head": n_head,
+    "n_layer": n_layer,
+    "dropout": dropout,
+    "block_size": block_size,
+    "vocab_size": vocab_size,
+    "best_val_loss": best_val_loss,
+}
+torch.save(final_checkpoint, DRIVE_CHECKPOINT_PATH)
+print(f"Checkpoint saved to Google Drive: {DRIVE_CHECKPOINT_PATH}")
