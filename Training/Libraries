@@ -1,0 +1,21 @@
+!pip install -q chess zstandard
+
+import math
+import random
+import statistics
+import io
+import urllib.request
+from IPython.display import SVG, display
+
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+import chess
+import chess.engine
+import chess.svg
+import chess.pgn
+import pandas as pd
+import zstandard as zstd
+
+random.seed(42)
