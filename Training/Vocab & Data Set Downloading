@@ -1,0 +1,115 @@
+PROMOTION_PIECES = [None, chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
+
+def build_move_vocab():
+    moves = set()
+    for from_sq in chess.SQUARES:
+        from_file = chess.square_file(from_sq)
+        from_rank = chess.square_rank(from_sq)
+        for to_sq in chess.SQUARES:
+            if to_sq == from_sq:
+                continue
+            to_file = chess.square_file(to_sq)
+            to_rank = chess.square_rank(to_sq)
+            d_file = to_file - from_file
+            d_rank = to_rank - from_rank
+            is_straight = (d_file == 0 or d_rank == 0)
+            is_diagonal = (abs(d_file) == abs(d_rank))
+            is_knight = (abs(d_file), abs(d_rank)) in [(1, 2), (2, 1)]
+            if is_straight or is_diagonal or is_knight:
+                moves.add((from_sq, to_sq, None))
+                if (from_rank == 6 and to_rank == 7) or (from_rank == 1 and to_rank == 0):
+                    for promo in PROMOTION_PIECES[1:]:
+                        moves.add((from_sq, to_sq, promo))
+
+    moves = sorted(moves, key=lambda m: (m[0], m[1], -1 if m[2] is None else m[2]))
+    move_to_id = {m: i for i, m in enumerate(moves)}
+    id_to_move = {i: m for i, m in enumerate(moves)}
+    return move_to_id, id_to_move
+
+move_to_id, id_to_move = build_move_vocab()
+NUM_MOVE_TOKENS = len(move_to_id)
+
+SPECIAL_TOKENS = ["<START>", "1-0", "0-1", "1/2-1/2", "*"]
+special_to_id = {tok: NUM_MOVE_TOKENS + i for i, tok in enumerate(SPECIAL_TOKENS)}
+id_to_special = {v: k for k, v in special_to_id.items()}
+
+vocab_size = NUM_MOVE_TOKENS + len(SPECIAL_TOKENS)
+
+def move_to_token_id(move: chess.Move) -> int:
+    return move_to_id[(move.from_square, move.to_square, move.promotion)]
+
+def token_id_to_move(token_id: int) -> chess.Move:
+    from_sq, to_sq, promo = id_to_move[token_id]
+    return chess.Move(from_sq, to_sq, promotion=promo)
+
+def is_good_time_control(game, min_base_seconds=180):
+    tc = game.headers.get("TimeControl", "-")
+    if tc == "-":
+        return False
+    try:
+        base_seconds = int(tc.split("+")[0])
+    except ValueError:
+        return False
+    return base_seconds >= min_base_seconds
+
+LICHESS_PGN_URL = "https://database.lichess.org/standard/lichess_db_standard_rated_2016-07.pgn.zst"
+LOCAL_ZST_PATH = "games.pgn.zst"
+
+print("Downloading PGN archive from Lichess...")
+urllib.request.urlretrieve(LICHESS_PGN_URL, LOCAL_ZST_PATH)
+
+MIN_ELO = 1500
+MIN_PLIES = 10
+MAX_GAMES = 15000
+
+def stream_games_from_zst(path, max_games):
+    games = []
+    dctx = zstd.ZstdDecompressor()
+    with open(path, "rb") as fh:
+        with dctx.stream_reader(fh) as reader:
+            text_stream = io.TextIOWrapper(reader, encoding="utf-8")
+            while len(games) < max_games:
+                game = chess.pgn.read_game(text_stream)
+                if game is None:
+                    break
+
+                try:
+                    white_elo = int(game.headers.get("WhiteElo", 0))
+                    black_elo = int(game.headers.get("BlackElo", 0))
+                except ValueError:
+                    continue
+                if white_elo < MIN_ELO or black_elo < MIN_ELO:
+                    continue
+
+                if not is_good_time_control(game):
+                    continue
+
+                if game.headers.get("Termination", "") != "Normal":
+                    continue
+
+                result = game.headers.get("Result", "*")
+                if result not in special_to_id:
+                    continue
+
+                move_ids = []
+                skip_game = False
+                for move in game.mainline_moves():
+                    try:
+                        move_ids.append(move_to_token_id(move))
+                    except KeyError:
+                        skip_game = True
+                        break
+
+                if skip_game or len(move_ids) < MIN_PLIES:
+                    continue
+
+                games.append((move_ids, result))
+    return games
+
+real_games = stream_games_from_zst(LOCAL_ZST_PATH, MAX_GAMES)
+random.shuffle(real_games)
+
+all_token_ids = []
+for move_ids, result in real_games:
+    game_tokens = [special_to_id["<START>"]] + move_ids + [special_to_id[result]]
+    all_token_ids.extend(game_tokens)
