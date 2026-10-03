@@ -1,0 +1,43 @@
+# ============================================================
+# Cell 1: Setup & Environment Initialization
+# ============================================================
+!pip install -q chess zstandard requests
+!apt-get install -y stockfish zstd -q > /dev/null 2>&1
+import math
+import random
+import statistics
+import json
+import os
+import io
+import time
+import subprocess
+import re
+import numpy as np
+import pandas as pd
+import chess
+import chess.engine
+import chess.svg
+import requests
+from google.colab import drive
+
+drive.mount('/content/drive')
+
+RESULTS_DIR = "/content/drive/MyDrive/babygpt_results"
+REASONABLE_MAX_PLIES = 200  # Capped at 200 plies to prevent long draw loops
+
+folders = ["visualizations", "games", "k_table", "temperature_sweep"]
+for f in folders:
+    os.makedirs(os.path.join(RESULTS_DIR, f), exist_ok=True)
+
+# Install and start Ollama daemon
+!curl -fsSL https://ollama.com/install.sh | sh
+
+ollama_process = subprocess.Popen(["ollama", "serve"])
+time.sleep(5)
+
+OLLAMA_MODEL = "llama3.2:1b"
+!ollama pull {OLLAMA_MODEL}
+
+STOCKFISH_PATH = "/usr/games/stockfish"
+OLLAMA_URL = "http://localhost:11434/api/generate"
+print(f"Setup complete. Using Ollama model: {OLLAMA_MODEL}")
