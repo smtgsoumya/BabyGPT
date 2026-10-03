@@ -1,0 +1,77 @@
+# ============================================================
+# Cell 3: Fast Temperature Sweep (3 Games / Temp)
+# ============================================================
+TEMPERATURES = [0.1, 0.3, 0.5, 0.7, 0.8, 1.0, 1.2, 1.5, 2.0]
+GAMES_PER_TEMP = 4  # Reduced to 3 games per temp for rapid completion (~35-45 mins total)
+
+all_temp_summaries = []
+
+for T in TEMPERATURES:
+    print(f"\n==================================================")
+    print(f"       RUNNING ANALYSIS FOR TEMPERATURE T = {T}")
+    print(f"==================================================")
+
+    temp_records = []
+
+    for g in range(1, GAMES_PER_TEMP + 1):
+        print(f"\n--- [T={T}] Generating Game {g}/{GAMES_PER_TEMP} ---")
+
+        board, illegal_rate = generate_game_with_ollama(
+            max_new_moves=REASONABLE_MAX_PLIES, max_attempts=5, temperature=T
+        )
+        sharpness, interest = analyze_game_interestingness(board)
+        winner = get_game_winner(board)
+        game_len = len(board.move_stack)
+
+        print(f"Game {g} | Moves: {game_len} | Outcome: {winner}")
+        print(f"Metrics -> Illegal Rate: {illegal_rate:.4f} | Interestingness: {interest:.2f} | Sharpness: {sharpness:.2f}")
+
+        # Save Visual SVG
+        last_move = board.peek() if game_len > 0 else None
+        svg_data = chess.svg.board(board=board, lastmove=last_move)
+        svg_filename = f"{RESULTS_DIR}/visualizations/ollama_temp_{T}_game_{g}.svg"
+        with open(svg_filename, "w") as f_svg:
+            f_svg.write(svg_data)
+
+        temp_records.append({
+            "temperature": T,
+            "game_id": g,
+            "moves": game_len,
+            "illegal_rate": illegal_rate,
+            "sharpness": sharpness,
+            "interestingness": interest,
+            "winner": winner
+        })
+
+    df_temp = pd.DataFrame(temp_records)
+    avg_len = df_temp["moves"].mean()
+    avg_illegal = df_temp["illegal_rate"].mean()
+    avg_interest = df_temp["interestingness"].mean()
+    avg_sharpness = df_temp["sharpness"].mean()
+
+    print(f"\n--- TEMPERATURE {T} SUMMARY ---")
+    print(f"Avg Game Length: {avg_len:.1f} moves")
+    print(f"Avg Illegal Retry Rate: {avg_illegal:.4f}")
+    print(f"Avg Sharpness (Stability): {avg_sharpness:.2f}")
+    print(f"Avg Interestingness: {avg_interest:.2f}")
+
+    all_temp_summaries.append({
+        "temperature": T,
+        "avg_game_length": avg_len,
+        "avg_illegal_rate": avg_illegal,
+        "avg_sharpness": avg_sharpness,
+        "avg_interestingness": avg_interest,
+    })
+
+df_all = pd.DataFrame(all_temp_summaries)
+df_all.to_csv(f"{RESULTS_DIR}/full_temperature_sweep_summary_ollama.csv", index=False)
+
+print("\n==================================================")
+print("     FINAL COMPARISON ACROSS ALL TEMPERATURES")
+print("==================================================")
+print(df_all.to_string(index=False))
+
+# Automatically pick the overall top temperature by highest interestingness
+best_row = df_all.loc[df_all["avg_interestingness"].idxmax()]
+BEST_TEMPERATURE = best_row["temperature"]
+print(f"\nSelected Best Temperature for K-Sweeps: T={BEST_TEMPERATURE} (Avg Interest={best_row['avg_interestingness']:.2f})")
