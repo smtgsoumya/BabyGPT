@@ -1,0 +1,9 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os
+DRIVE_CHECKPOINT_DIR = "/content/drive/MyDrive/babygpt_checkpoints"
+os.makedirs(DRIVE_CHECKPOINT_DIR, exist_ok=True)
+DRIVE_CHECKPOINT_PATH = os.path.join(DRIVE_CHECKPOINT_DIR, "babygpt_best.pt")
+
+UNLIMITED_MOVES = 100_000
