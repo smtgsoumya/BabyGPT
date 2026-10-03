@@ -1,0 +1,387 @@
+import numpy as np
+import pandas as pd
+import statistics
+import math
+import random
+import torch
+import torch.nn.functional as F
+import chess
+import chess.engine
+import chess.svg
+import json
+import os
+import urllib.request
+import zstandard as zstd
+import io
+
+STOCKFISH_PATH = "/usr/games/stockfish"
+
+# --- Verification Loop Generator ---
+def propose_move_babygpt_unmasked(model, idx, board, attempt, feedback):
+    with torch.no_grad():
+        idx_cond = idx[:, -block_size:]
+        logits, _ = model(idx_cond)
+        logits = logits[0, -1, :] / (1.0 + 0.5 * attempt)
+        probs = F.softmax(logits, dim=-1)
+        token_id = torch.multinomial(probs, num_samples=1).item()
+
+    if token_id in id_to_special:
+        return "0000"
+    return token_id_to_move(token_id).uci()
+
+def generate_move_with_verification(propose_move_fn, board, max_attempts=5):
+    feedback = None
+    for attempt in range(max_attempts):
+        move_str = propose_move_fn(board, attempt, feedback)
+        try:
+            move = board.parse_uci(move_str)
+        except ValueError:
+            move = None
+
+        if move is not None and move in board.legal_moves:
+            return move, attempt + 1
+    return random.choice(list(board.legal_moves)), max_attempts
+
+def generate_game_with_verification_loop(model, max_new_moves=REASONABLE_MAX_PLIES, max_attempts=5):
+    board = chess.Board()
+    idx = torch.tensor([[special_to_id["<START>"]]], dtype=torch.long, device=device)
+    illegal_attempts_total = 0
+    moves_played = 0
+
+    for _ in range(max_new_moves):
+        if board.is_game_over(claim_draw=True):
+            break
+
+        move, attempts_used = generate_move_with_verification(
+            propose_move_fn=lambda b, a, fb: propose_move_babygpt_unmasked(model, idx, b, a, fb),
+            board=board,
+            max_attempts=max_attempts,
+        )
+        illegal_attempts_total += (attempts_used - 1)
+        moves_played += 1
+
+        move_token_id = move_to_token_id(move)
+        idx = torch.cat((idx, torch.tensor([[move_token_id]], device=device)), dim=1)
+        board.push(move)
+
+    result = board.result(claim_draw=True) if board.is_game_over(claim_draw=True) else "*"
+    idx = torch.cat((idx, torch.tensor([[special_to_id[result]]], device=device)), dim=1)
+
+    return idx[0].tolist(), board, illegal_attempts_total / max(moves_played, 1)
+
+# --- Ground-Truth Move Accuracy Evaluator ---
+def compute_prefix_accuracy(model, ground_truth_moves, k):
+    if k == 0 or len(ground_truth_moves) == 0:
+        return 0.0
+
+    eval_plies = min(k, len(ground_truth_moves))
+    board = chess.Board()
+    token_ids = [special_to_id["<START>"]]
+    correct_predictions = 0
+
+    for i in range(eval_plies):
+        target_move = ground_truth_moves[i]
+        idx = torch.tensor([token_ids], dtype=torch.long, device=device)[:, -block_size:]
+
+        with torch.no_grad():
+            logits, _ = model(idx)
+            logits = logits[0, -1, :]
+
+            legal_moves = list(board.legal_moves)
+            legal_token_ids = [move_to_token_id(m) for m in legal_moves]
+            mask = torch.full_like(logits, float('-inf'))
+            mask[legal_token_ids] = 0.0
+
+            top_pred_id = torch.argmax(logits + mask).item()
+
+        if top_pred_id in move_to_id.values():
+            pred_move = token_id_to_move(top_pred_id)
+            if pred_move == target_move:
+                correct_predictions += 1
+
+        token_ids.append(move_to_token_id(target_move))
+        board.push(target_move)
+
+    return (correct_predictions / eval_plies) * 100.0
+
+# --- Scaled Game Quality Metrics ---
+def analyze_game_interestingness(board):
+    if len(board.move_stack) < 2:
+        return 100.0, 0.0
+
+    try:
+        engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+    except Exception:
+        return 100.0, 0.0
+
+    temp_board = chess.Board()
+    cp_evals = []
+
+    for move in board.move_stack:
+        temp_board.push(move)
+        info = engine.analyse(temp_board, chess.engine.Limit(depth=5))
+        score = info["score"].relative
+
+        if score.is_mate():
+            mate_moves = score.mate()
+            if mate_moves is not None:
+                cp_evals.append(1000.0 if mate_moves > 0 else -1000.0)
+            else:
+                cp_evals.append(0.0)
+        else:
+            cp_val = score.score()
+            if cp_val is not None:
+                cp_evals.append(float(max(-1000, min(1000, cp_val))))
+            else:
+                cp_evals.append(0.0)
+
+    engine.quit()
+
+    sharpness_raw = statistics.stdev(cp_evals) if len(cp_evals) > 1 else 0.0
+    eval_swings = sum(abs(cp_evals[i] - cp_evals[i-1]) for i in range(1, len(cp_evals)))
+    avg_swing = eval_swings / max(len(cp_evals) - 1, 1)
+
+    raw_interest = (sharpness_raw * 0.4) + (avg_swing * 0.6)
+
+    interestingness = 100.0 * (1.0 - math.exp(-raw_interest / 350.0))
+    sharpness_scaled = 100.0 * math.exp(-sharpness_raw / 300.0)
+
+    return sharpness_scaled, interestingness
+
+# --- Repetition & Confidence Analysis ---
+def analyze_game_repetition_and_confidence(model, token_ids):
+    board = chess.Board()
+    position_counts = {}
+    stuck_in_loop = False
+    ended_by_threefold = False
+
+    position_counts[board.fen().split(' ')[0]] = 1
+    probs_list = []
+    move_tokens = [t for t in token_ids if t not in id_to_special]
+
+    for i, tok in enumerate(move_tokens):
+        if i > 0:
+            input_seq = torch.tensor([token_ids[:i+1]], dtype=torch.long, device=device)[:, -block_size:]
+            with torch.no_grad():
+                logits, _ = model(input_seq)
+                probs = F.softmax(logits[0, -1, :], dim=-1)
+                probs_list.append(probs[tok].item())
+
+        move = token_id_to_move(tok)
+        if move in board.legal_moves:
+            board.push(move)
+            board_key = board.fen().split(' ')[0]
+            position_counts[board_key] = position_counts.get(board_key, 0) + 1
+            if position_counts[board_key] >= 3:
+                stuck_in_loop = True
+
+    if board.can_claim_threefold_repetition():
+        ended_by_threefold = True
+
+    avg_confidence = statistics.mean(probs_list) if probs_list else 0.0
+    return stuck_in_loop, ended_by_threefold, avg_confidence
+
+# --- K-Move Prefix Generation ---
+def generate_legal_game_from_prefix(model, prefix_moves, max_new_moves=REASONABLE_MAX_PLIES, temperature=0.8):
+    board = chess.Board()
+    token_ids = [special_to_id["<START>"]]
+
+    for move in prefix_moves:
+        if move in board.legal_moves:
+            token_ids.append(move_to_token_id(move))
+            board.push(move)
+        else:
+            break
+
+    idx = torch.tensor([token_ids], dtype=torch.long, device=device)
+
+    for _ in range(max_new_moves):
+        if board.is_game_over(claim_draw=True):
+            break
+
+        idx_cond = idx[:, -block_size:]
+        with torch.no_grad():
+            logits, _ = model(idx_cond)
+            logits = logits[:, -1, :] / temperature
+
+            legal_moves = list(board.legal_moves)
+            legal_token_ids = [move_to_token_id(m) for m in legal_moves]
+
+            mask = torch.full_like(logits, float('-inf'))
+            mask[0, legal_token_ids] = 0.0
+            masked_logits = logits + mask
+
+            probs = F.softmax(masked_logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+
+        chosen_move = token_id_to_move(idx_next.item())
+        board.push(chosen_move)
+        idx = torch.cat((idx, idx_next), dim=1)
+
+    return idx[0].tolist(), board
+
+# --- Fixed Stockfish Matches with Rating Calibration ---
+def play_against_stockfish(model, elo_rating=1500, temperature=0.8, model_is_white=True):
+    engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+
+    calibrated_elo = max(1320, elo_rating)
+    engine.configure({
+        "UCI_LimitStrength": True,
+        "UCI_Elo": calibrated_elo
+    })
+
+    board = chess.Board()
+    token_ids = [special_to_id["<START>"]]
+
+    while not board.is_game_over(claim_draw=True):
+        if (board.turn == chess.WHITE and model_is_white) or (board.turn == chess.BLACK and not model_is_white):
+            idx = torch.tensor([token_ids], dtype=torch.long, device=device)[:, -block_size:]
+            with torch.no_grad():
+                logits, _ = model(idx)
+                logits = logits[0, -1, :] / temperature
+                legal_moves = list(board.legal_moves)
+                legal_token_ids = [move_to_token_id(m) for m in legal_moves]
+
+                mask = torch.full_like(logits, float('-inf'))
+                mask[legal_token_ids] = 0.0
+                probs = F.softmax(logits + mask, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).item()
+
+            move = token_id_to_move(next_token)
+            token_ids.append(next_token)
+            board.push(move)
+        else:
+            result = engine.play(board, chess.engine.Limit(time=0.1))
+            move = result.move
+            token_ids.append(move_to_token_id(move))
+            board.push(move)
+
+    engine.quit()
+
+    outcome = board.outcome(claim_draw=True)
+    if outcome is None or outcome.winner is None:
+        score = 0.5
+    elif (outcome.winner == chess.WHITE and model_is_white) or (outcome.winner == chess.BLACK and not model_is_white):
+        score = 1.0
+    else:
+        score = 0.0
+
+    return score, board
+
+def estimate_model_elo(model, target_elo=1500, num_games=4, temperature=0.8):
+    total_score = 0.0
+    for i in range(num_games):
+        is_white = (i % 2 == 0)
+        score, _ = play_against_stockfish(model, elo_rating=target_elo, temperature=temperature, model_is_white=is_white)
+        total_score += score
+
+    win_rate = total_score / num_games
+    if win_rate == 0:
+        performance_elo = target_elo - 400
+    elif win_rate == 1:
+        performance_elo = target_elo + 400
+    else:
+        performance_elo = target_elo - 400 * math.log10((1 / win_rate) - 1)
+
+    return total_score, performance_elo
+
+# --- Held-Out Dataset Setup ---
+HOLDOUT_PGN_URL = "https://database.lichess.org/standard/lichess_db_standard_rated_2016-08.pgn.zst"
+HOLDOUT_LOCAL_ZST_PATH = "holdout_games.pgn.zst"
+HOLDOUT_GAMES_PATH = f"{RESULTS_DIR}/games/holdout_games.json"
+NUM_HOLDOUT_GAMES = 100
+HOLDOUT_MIN_PLIES = 160
+HOLDOUT_MIN_ELO = 1500
+
+def is_good_time_control(game, min_base_seconds=180):
+    tc = game.headers.get("TimeControl", "-")
+    if tc == "-":
+        return False
+    try:
+        base_seconds = int(tc.split("+")[0])
+    except ValueError:
+        return False
+    return base_seconds >= min_base_seconds
+
+def download_and_fix_holdout_games(num_games=NUM_HOLDOUT_GAMES, min_plies=HOLDOUT_MIN_PLIES):
+    if os.path.exists(HOLDOUT_GAMES_PATH):
+        print(f"Loading already-fixed held-out games from {HOLDOUT_GAMES_PATH}")
+        with open(HOLDOUT_GAMES_PATH, "r") as f:
+            saved = json.load(f)
+        games = []
+        for g in saved:
+            games.append([chess.Move.from_uci(u) for u in g["moves_uci"]])
+        return games
+
+    print(f"Downloading held-out PGN archive: {HOLDOUT_PGN_URL}")
+    urllib.request.urlretrieve(HOLDOUT_PGN_URL, HOLDOUT_LOCAL_ZST_PATH)
+
+    games = []
+    games_to_save = []
+    dctx = zstd.ZstdDecompressor()
+    with open(HOLDOUT_LOCAL_ZST_PATH, "rb") as fh:
+        with dctx.stream_reader(fh) as reader:
+            text_stream = io.TextIOWrapper(reader, encoding="utf-8")
+            while len(games) < num_games:
+                game = chess.pgn.read_game(text_stream)
+                if game is None:
+                    break
+
+                try:
+                    white_elo = int(game.headers.get("WhiteElo", 0))
+                    black_elo = int(game.headers.get("BlackElo", 0))
+                except ValueError:
+                    continue
+                if white_elo < HOLDOUT_MIN_ELO or black_elo < HOLDOUT_MIN_ELO:
+                    continue
+                if not is_good_time_control(game):
+                    continue
+                if game.headers.get("Termination", "") != "Normal":
+                    continue
+
+                moves = list(game.mainline_moves())
+                if len(moves) < min_plies:
+                    continue
+
+                games.append(moves)
+                games_to_save.append({"moves_uci": [m.uci() for m in moves]})
+
+    os.makedirs(os.path.dirname(HOLDOUT_GAMES_PATH), exist_ok=True)
+    with open(HOLDOUT_GAMES_PATH, "w") as f:
+        json.dump(games_to_save, f, indent=2)
+    print(f"Fixed {len(games)} held-out games, saved to {HOLDOUT_GAMES_PATH}")
+    return games
+
+def run_heldout_k_experiment(model, holdout_games, k_values, temperature):
+    interest_data = {}
+    accuracy_data = {}
+
+    for k in k_values:
+        k_interest_scores = []
+        k_accuracies = []
+
+        for game_moves in holdout_games:
+            prefix = [] if k == 0 else game_moves[:min(k, len(game_moves))]
+
+            acc = compute_prefix_accuracy(model, game_moves, k)
+            k_accuracies.append(acc)
+
+            token_ids, final_board = generate_legal_game_from_prefix(
+                model, prefix, temperature=temperature
+            )
+            _, interest = analyze_game_interestingness(final_board)
+            k_interest_scores.append(interest)
+
+        mean_int = np.mean(k_interest_scores)
+        sd_int = np.std(k_interest_scores, ddof=1) if len(k_interest_scores) > 1 else 0.0
+
+        mean_acc = np.mean(k_accuracies)
+        sd_acc = np.std(k_accuracies, ddof=1) if len(k_accuracies) > 1 else 0.0
+
+        interest_data[f"K={k}"] = f"{mean_int:.1f} \u00b1 {sd_int:.1f}"
+        accuracy_data[f"K={k}"] = f"{mean_acc:.1f}% \u00b1 {sd_acc:.1f}%"
+
+        print(f"K={k}: Accuracy = {mean_acc:.1f}% \u00b1 {sd_acc:.1f}% | Interest = {mean_int:.1f} \u00b1 {sd_int:.1f}")
+
+    df_results = pd.DataFrame([accuracy_data, interest_data], index=["Ground-Truth Accuracy", "Interestingness Score"])
+    return df_results
